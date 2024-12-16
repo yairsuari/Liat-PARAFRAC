@@ -1,0 +1,1346 @@
+---
+Based on the viggenete PARAFAC_analysis_of_EEM 
+---
+
+# Packages
+
+```{r, message=FALSE, warning=FALSE, include=FALSE}
+library(staRdom)
+library(EEM)
+library(eemR)
+library(knitr)
+library(kableExtra)
+library(tidyverse)
+library(dplyr)
+library(tidyr)
+library(pracma)
+library(readr)
+
+# Define the number of cores
+cores <- detectCores(logical = FALSE)
+```
+
+# Custom functions
+```{r}
+# Functions to manipulate eems within staRdom environment.
+
+## eem_apply function, it applies a function on each eem matrix in an eemlist.
+#Returns either a modified eemlist (modified by func) or a list of values (results from the function func)
+eem_apply <- function(data, func, return = c("eemlist","value"),...){
+  stopifnot(class(data) == "eemlist")
+  ress <- lapply(data, function(eem){
+    eem$x <- func(eem$x)#,...
+    if(return[1] == "eemlist"){
+      res <- eem
+    } else {
+      res <- eem$x
+    }
+    res
+  })
+  if(return[1] == "eemlist"){
+    class(ress) <- "eemlist"
+  }
+  ress
+}
+
+## norm_max function: used for normalizing each EEM to its maximum value (use with eem_apply)
+norm_max <- function(x, ...){
+  x/max(x)
+}
+
+## neg_to_zero function: used for substituting each negative fluorescence with zero in an EEM (use with eem_apply)
+neg_to_zero<- function(x) {(abs(x)+x)/2
+}
+
+## Funftion to export eem's from a list to csv files
+eem_export <- function(file, format = c("csv","mat"), ...){
+  if(format[1] == "mat"){
+    eem_export_matlab(file = file, ...)
+  } else if(format[1] == "csv"){
+    if(!file.exists(file) | !file.info(file)$isdir){
+      stop(file, " is not a valid folder!")
+    } else{
+      eem <- eem_bind(...)
+      if(!identical(eem_names(eem), eem_names(eem) %>% unique())){
+        eem_names(eem) <- eem_names(eem) %>% make.unique()
+        warning("Sample names were not unique! Unique names were produced automatically.")
+      }
+      lapply(eem, function(e){
+        data.frame(e$x) %>%
+          setNames(e$ex) %>%
+          mutate(em = e$em) %>%
+          select(em, as.character(e$ex)) %>%
+          write_csv(file = paste0(file,"/",e$sample,".csv"))
+      })
+    }
+  } else {
+    stop("The supplied format is not (yet) available!")
+  }
+  invisible(0)
+}
+```
+
+# Import list of EEM's
+```{r eval=TRUE, include=TRUE}
+# Make sure to change the Date of the folder
+eem_list <- eem_read("C:/Users/lenovo/Documents/Phd/Chapter 3/FDOM/November2023_Red_sea/20241031/EEM", recursive = TRUE, import_function = eem_csv)
+
+setwd("C:/Users/lenovo/Documents/Phd/Chapter 3/FDOM/November2023_Red_sea/20241031/Absorbance")
+# Import the absorbance data
+
+## Make sure to change the Date of the folder
+absorbance <- absorbance_read("C:/Users/lenovo/Documents/Phd/Chapter 3/FDOM/November2023_Red_sea/20241031/Absorbance/2024-10-31_Absorbance.csv")
+```
+
+```{r eval=TRUE, fig.height=5, fig.width=6, message=FALSE, warning=FALSE, include=TRUE, paged.print=TRUE}
+eem_overview_plot(eem_list, spp=9, contour = TRUE)
+```
+
+## Check data to see for duplicates and if absorbance data is missing
+
+```{r eval=TRUE, include=TRUE}
+problem <- eem_checkdata(eem_list, absorbance, meta = NULL, metacolumns = NULL,error=FALSE)
+```
+
+## Absorbance baseline correction
+
+The instrumental baseline drift in absorbance data can be corrected by subtracting the mean of the absorbance at high wavelengths [@li_utilization_2017]. The default is to use the spectrum between 680 and 700 nm but any other range can be set manually.
+
+```{r eval=TRUE, include=TRUE}
+absorbance <- abs_blcor(absorbance, wlrange = c(680,700))
+```
+
+## Blank subtraction
+
+Blanks are samples of ultrapure water that must contain either "nano", "miliq", "milliq", "mq" or "blank" in their file names. They can be used to apply blank subtraction and Raman normalisation (see below) and are used for samples in the same (sub)folders. If multiple blanks were measured, they are averaged. Blanks are subtracted from each sample to reduce the effects of scatter bands and systematic errors.
+
+```{r eval=TRUE, include=TRUE}
+# blank subtraction
+eem_list <- eem_remove_blank(eem_list)
+```
+
+```{r eval=TRUE, fig.width=6, fig.height = 5, message=FALSE, warning=FALSE, include=TRUE, paged.print=TRUE}
+eem_overview_plot(eem_list, spp=9, contour = TRUE)
+```
+
+## Inner-filter effect correction
+
+Inner-filter effects (IFE) occur when excitation light is absorbed by chromophores. A simple method to correct the IFE is to use the sample's absorbance. The EEM is multiplied by a correction matrix corresponding to each wavelength pair [@kothawala_inner_2013]. In case of a maximum absorbance larger than 1.5 cm⁻¹, the sample needs to be diluted, because the absorbance is to high to be corrected by the applied IFE function (or mathematical IFE correction in general).
+
+```{r eval=TRUE, include=TRUE}
+# Specify the cuvette length
+eem_list <- eem_ife_correction(eem_list, absorbance, cuvl = 1)
+```
+
+```{r eval=TRUE, fig.width=6, fig.height = 5, message=FALSE, warning=FALSE, include=TRUE}
+eem_overview_plot(eem_list, spp=9, contour = TRUE)
+```
+
+## Raman normalisation
+
+Fluorescence intensities can differ between analyses on different fluorometers, different settings or different days on the same fluorometer. Therefore it can be normalised to a standard scale of Raman Units by dividing all intensities by the area of the Raman peak of a ultrapure water sample. All fluorescence intensities are divided by the area (integral) of the Raman peak (excitation of 350 nm between an emission of 371 nm and 428 nm).
+
+```{r eval=TRUE, include=TRUE}
+raman_normalisation <- eem_raman_area(eem_list, blanks_only = TRUE, average = T)
+
+eem_list <- eem_raman_normalisation2(eem_list, blank = raman_normalisation$raman_area)
+```
+
+```{r eval=TRUE, fig.width=6, fig.height = 5, message=FALSE, warning=FALSE, include=TRUE}
+eem_overview_plot(eem_list, spp=9, contour = TRUE)
+```
+
+## Remove blanks from sample set
+
+From this step onwards, blanks are not needed anymore.
+
+```{r eval=TRUE, include=TRUE}
+eem_list <- eem_extract(eem_list, c("nano", "miliq", "milliq", "mq", "blank"),ignore_case = TRUE)
+
+absorbance <- dplyr::select(absorbance, -matches("nano|miliq|milliq|mq|blank", ignore.case = TRUE))
+```
+
+## Remove and interpolate scattering
+
+The function removes scattering from the samples. `remove_scatter` is a logical vector where values are ordered by the meaning of "raman1", "raman2", "rayleigh1" and "rayleigh2". `remove_scatter_width` is either a number or a vector containing 4 different wavelength width in nm, one for each scatter type [@murphy_fluorescence_2013; @lakowicz_principles_2006].
+
+```{r eval=TRUE, include=TRUE}
+remove_scatter <- c(TRUE, TRUE, TRUE, TRUE)
+remove_scatter_width <- c(15,15,15,15)
+
+eem_list <- eem_rem_scat(eem_list, remove_scatter = remove_scatter, remove_scatter_width = remove_scatter_width)
+```
+
+```{r eval=TRUE, fig.width=6, fig.height = 5, message=FALSE, warning=FALSE, include=TRUE}
+eem_overview_plot(eem_list, spp=9, contour = TRUE)
+```
+
+Although it is not always necessary, removed scatter areas should be interpolated for reasonable results and faster calculation in the PARAFAC analysis [@elcoroaristizabal_parafac_2015]. `eem_interp` offers different methods of interpolation. The types of interpolation are (0) setting all NAs to 0, (1) spline interpolation with `mba.points` [@lee_scattered_1997], (2) excitation and emission wavelength-wise interpolation with `pchip` [@moler_numerical_2004] and subsequent `mean`, (3) excitation wavelength-wise interpolation with `pchip` and (4) linear excitation and emission wavelength-wise interpolation with `na.approx` and again subsequent `mean` calculation. Calculating the mean is a way of ensuring NAs are also interpolated where missing boundary values would make that impossible. In case of interpolation type 1, `extend = FALSE` prevents the function from extrapolating. We recommend to use type 1 as a start, because its accuracy in interpolating surfaces. The smooth but still complex surface is exactly what one would expect from a theoretical EEM. In case of recognisable patterns in the residual plots close to the scatter areas or many not converging initialisations of the PARAFAC model, another interpolation method could improve the results.
+
+```{r eval=TRUE, include=TRUE}
+eem_list <- eem_interp(eem_list, cores = cores, type = 1, extend = FALSE)
+```
+
+```{r eval=TRUE, fig.width=6, fig.height = 5, message=FALSE, warning=FALSE, include=TRUE}
+eem_overview_plot(eem_list, spp=10, contour = TRUE)
+```
+
+## Peak picking and indices
+
+```{r eval=TRUE, warning=FALSE, include=TRUE}
+bix <- eem_biological_index(eem_list)
+coble_peaks <- eem_coble_peaks(eem_list)
+fi <- eem_fluorescence_index(eem_list)
+hix <- eem_humification_index(eem_list, scale = TRUE)
+
+# Add additional peaks specific in my data
+#b_act <- eemR::eem_peaks(eem_list, ex = 266, em = 310) %>% 
+#  select(-c(ex, em)) %>% 
+#  rename(`b'` = "peak_intensity")
+#t_act <- eemR::eem_peaks(eem_list, ex = 266, em = 340) %>% 
+#  select(-c(ex, em))%>% 
+#  rename(`t'` = "peak_intensity")
+# From samples F360, F328 and more
+#a_act <- eemR::eem_peaks(eem_list, ex = 256, em = 368) %>% 
+#  select(-c(ex, em))%>% 
+#  rename(`a'` = "peak_intensity")
+# from samples F302 and more
+#flu_1 <- eemR::eem_peaks(eem_list, ex = 280, em = 512) %>% 
+#  select(-c(ex, em)) %>% 
+#  rename(flu_1 = "peak_intensity")
+#flu_2 <- eemR::eem_peaks(eem_list, ex = 320, em = 512) %>% 
+#  select(-c(ex, em))%>% 
+#  rename(flu_2 = "peak_intensity")
+#flu_3 <- eemR::eem_peaks(eem_list, ex = 374, em = 512) %>% 
+#  select(-c(ex, em))%>% 
+#  rename(flu_3 = "peak_intensity")
+
+
+indices_peaks <- bix %>%
+  full_join(coble_peaks, by = "sample") %>%
+  full_join(fi, by = "sample") %>%
+  full_join(hix, by = "sample") 
+
+#%>% 
+#  full_join(b_act, by = "sample") %>% 
+#  full_join(t_act, by = "sample") %>% 
+#  full_join(a_act, by = "sample") %>% 
+#  full_join(flu_1, by = "sample") %>% 
+#  full_join(flu_2, by = "sample") %>% 
+#  full_join(flu_3, by = "sample")
+
+indices_peaks
+
+# Change the Date in file name
+write.csv(x = indices_peaks, file = "C:/Users/lenovo/Documents/Phd/Chapter 3/FDOM/November2023_Red_sea/peaks_after_conversion/peaks_31_10_2024.csv")
+
+```
+
+## Extracting EEMs from the list to csv files
+
+```{r}
+# Create a folder to store the csv files and save its path in exportfile object:
+exportfolder <- "C:/Users/lenovo/Documents/Phd/Chapter 3/FDOM/November2023_Red_sea/data_after_conversion"
+
+# run the eem_export function, specifying the csv format. this will create 1 csv file for each eem. the files will be named as the eems in eem_list, with "wide" format, i.e. 1 column for em and 1 column for each ex.
+eem_export(file = exportfolder, format = 'csv', eem_list)
+```
+
+
+#~~~ Rerun all the above for the next analysis date folder~~~
+
+
+
+# Import all csv files and combine to a uniform wide format data
+
+```{r}
+exportfolder1 <- "C:/Users/lenovo/Documents/Phd/Chapter 3/FDOM/November2023_Red_sea/data_after_conversion/"
+# get the name for each csv file created in the exportfolder
+eemfiles <- list.files(path = exportfolder1, pattern = '//.csv$', full.names = F)
+
+# loop to combine all eems in export folder into a single long-format df:
+for (i in eemfiles){
+  #print(paste0(exportfolder1, i))
+eem_long <- read.csv(paste0(exportfolder1, i), check.names = F)%>%
+  pivot_longer(cols = -em, names_to = "ex",  values_to = gsub(pattern=".csv",replacement="", x=i))%>%
+  mutate(ex=as.numeric(ex))
+if (i==eemfiles[1]){eemlist_df<-  eem_long }else{
+  eemlist_df<- merge.data.frame(eemlist_df,eem_long, by=c("ex","em"))
+}
+if(i==eemfiles[length(eemfiles)]){ rm(eem_long,i,eemfiles)}
+}
+eemlist_df
+```
+
+# Create a data with duplicates for analytical error
+
+```{r}
+samples_for_error <- c("F305", "F305b", "F323", "F323b", "F307", "F307b", 
+                       "F311", "F311_2", "F352", "F352b", "F353", "F353b", 
+                       "F363", "F363b", "F378", "F378_b", "F379", "F379_b", "F384", 
+                       "F384b")
+samples_to_remove <- c("F305b", "F323b", "F307b", "F311_2", "F352b", 
+                       "F353b", "F363b", "F378_b", "F379_b", "F384b")
+```
+
+## Convert to long format and add metadata
+
+```{r}
+#  
+eemlist_df_long <- eemlist_df %>%
+  pivot_longer(cols = -c(ex, em), names_to = "Vial number", values_to = "fluor") %>% 
+  relocate(`Vial number`, .before = ex)# %>% 
+#  filter(!`Vial number` %in% samples_to_remove)
+
+# Import metadata from googlesheets
+fdom_rawmetadata <- googlesheets4::read_sheet(ss = "https://docs.google.com/spreadsheets/d/1gVynmRrzcKKm47eZmsxn250SDFG-WePbc6-CjoV_2Rs/edit#gid=1030601522", sheet = "FDOM")
+
+fdom_metadata <- fdom_rawmetadata %>% 
+  filter(!is.na(`Vial number`)) %>% 
+  select(-(`Start time`:length(.))) 
+
+fdom_data <- left_join(fdom_metadata, eemlist_df_long) %>% 
+  filter(!is.na(`fluor`)) %>% 
+  rename("Excitation" = ex,
+         "Emission" = em) %>% 
+  select(-`Vial number`) %>%
+  mutate(fluor = ifelse(Excitation < Emission, fluor, NA)) %>% 
+  pivot_wider(id_cols = c(Date, `Time (day / night)`, Group, `Unique code`, Excitation, Emission), 
+              names_from = `Position (In / Ex)`, 
+              values_from = fluor)
+
+delta_data <- fdom_data %>% 
+  mutate(delta_abs = Ex - In,
+         delta_percentage = ((Ex - In) / Ex)*100,
+         log_ratio = log(Ex / In))
+
+mean_delta_data <- delta_data %>% 
+  group_by(Group, Excitation, Emission) %>% 
+  summarise_at(vars(In, Ex, delta_abs, delta_percentage, log_ratio), funs(mean, median, sd, n()))
+
+```
+
+# Peaks indices
+
+# Specify the folder with EEM's for converion to CSV
+
+## Run the next two chunks together
+
+```{r setup}
+knitr::opts_knit$set(root.dir = 'C:/Users/lenovo/Documents/Phd/Chapter 3/FDOM/November2023_Red_sea/peaks_after_conversion/')
+```
+
+```{r}
+peaks_rawdata <- list.files(pattern = "\\.csv$") %>% 
+    map_df(~read_csv(.), show_col_types = FALSE)
+
+peaks_data <- peaks_rawdata %>% 
+  select(-1) %>% 
+  rename("Vial number" = sample)# %>% 
+#  filter(!`Vial number` %in% samples_to_remove)
+
+peaks_data1 <- left_join(fdom_metadata, peaks_data) %>% 
+  filter(!is.na(`bix`)) %>% 
+  pivot_longer(cols = bix:hix, names_to = "Peaks", values_to = "value") %>% 
+  select(-`Vial number`) %>%
+  pivot_wider(id_cols = c("Sampler","Site","Date","Depth (m)","Water Temp","Time (day / night)", "Sampling type","Group","Species","Species code","Individual number","Unique code","Peaks"), 
+              names_from = `Position (In / Ex)`, 
+              values_from = value) %>%
+  mutate(Peaks = factor(Peaks, levels = c("b", "t", "a", "c", "m", "fi", "hix", "bix")))
+
+peaks_position <- peaks_data1 %>% 
+  select(Peaks) %>% 
+  distinct()# %>% 
+  #filter(!Peaks %in% c("b'", "t'", "a'", "flu_1", "flu_2", "flu_3"))
+
+peaks_position$Excitation = c(NA, 274, 274, 260, 312, 350, NA, NA)#, 266, 266, 256, 280, 320, 374)
+peaks_position$Emission   = c(NA, 310, 340, 420, 400, 450, NA, NA)#, 310, 340, 368, 512, 512, 512)
+
+delta_peaks <- peaks_data1 %>% 
+  mutate(delta = Ex - In,
+         delta_percent = ((Ex - In)/In)*100,
+         log_ratio = log(Ex / In))
+
+delta_peaks_mean <- delta_peaks %>% 
+  pivot_longer(cols = 14:18, names_to = "Index", values_to = "value") %>% 
+  group_by(Group, Peaks, Index) %>% 
+  summarise_at(vars(value), funs(mean, sd, n())) %>% 
+  mutate(conf.int = sd/sqrt(n) * qt(p = 0.975, df = n-1))
+```
+
+## Plots
+
+```{r}
+delta_peaks %>% 
+  #filter(!Peaks %in% add_peaks_vec) %>% 
+  ggplot(aes(x = Group, y = delta, fill = Group))+
+  geom_boxplot()+
+  stat_summary(fun.y = mean, shape = 4, size = 0.2)+
+  facet_wrap(~ Peaks, scales = "free")+
+ # coord_cartesian(ylim = c(-0.1,0.1))+
+  #scale_y_continuous(limits = c(-0.1,0.1))+
+  geom_hline(aes(yintercept = 0), color = "red")+
+  theme(panel.background = element_blank(),
+        axis.line = element_line(colour = "black"))
+
+delta_peaks %>% 
+  filter(!Peaks %in% add_peaks_vec) %>% 
+  ggplot(aes(x = Peaks, y = delta_percent, fill = Group))+
+  geom_boxplot()+
+  stat_summary(fun.y = mean, shape = 4, size = 0.2)+
+  facet_grid(~ Group)+
+  coord_cartesian(ylim = c(-50, 50))+
+  scale_y_continuous(limits = c(-50,50))+
+  labs(y = "Delta (%)", x = NULL)+
+  geom_hline(aes(yintercept = 0), color = "red")+
+  theme(panel.background = element_blank(),
+        axis.line = element_line(colour = "black"),
+        axis.text = element_text(size = 12, color = "black"),
+        strip.text = element_text(size = 14),
+        axis.title = element_text(size = 14))
+
+delta_peaks %>% 
+ # filter(delta_percent < 100, delta_percent > -100) %>% 
+  ggplot(aes(x = Peaks, y = log_ratio, fill = Group))+
+  geom_boxplot()+
+  stat_summary(fun.y = mean, shape = 4, size = 0.2)+
+  facet_grid(~ Group)+
+  coord_cartesian(ylim = c(-1, 1))+
+  scale_y_continuous(limits = c(-1,1))+
+  geom_hline(aes(yintercept = 0), color = "red")+
+  theme(panel.background = element_blank(),
+        axis.line = element_line(colour = "black"))
+  
+delta_peaks_mean %>% 
+  filter(Index == "log_ratio") %>% 
+  ggplot(aes(x = Peaks, y = mean, color = Group))+
+  geom_point()+
+  geom_errorbar(aes(ymin = mean - conf.int, ymax = mean + conf.int))+
+  facet_grid(~ Group)+
+  #coord_cartesian(ylim = c(-1, 1))+
+  #scale_y_continuous(limits = c(-1,1))+
+  geom_hline(aes(yintercept = 0), color = "red")+
+  theme(panel.background = element_blank(),
+        axis.line = element_line(colour = "black"))
+
+
+# Delta of peak as a function of In intensity
+delta_peaks %>%   
+  ggplot(aes(x = In, y = delta, color = Group))+
+  geom_point()+
+  geom_smooth(aes(x = In, y = delta), method = "lm")+
+  ggpubr::stat_regline_equation(aes(label =  paste(..rr.label..)))+  
+  scale_color_manual(values = c("#D2B600", "#0B4F6C"))+
+  facet_wrap(~ Peaks, scales = "free")+
+  labs(y = "Delta intensity", x = "Ambient intensity")+
+  theme(panel.background = element_blank(),
+        axis.line = element_line(colour = "black"),
+        axis.text = element_text(size = 12, color = "black"),
+        strip.text = element_text(size = 14),
+        axis.title = element_text(size = 14))
+
+
+# delta of additional peaks
+add_peaks_vec <- c("b'", "t'", "a'", "flu_1", "flu_2", "flu_3")
+
+delta_peaks %>% 
+ # filter(Peaks %in% add_peaks_vec) %>%
+  ggplot(aes(x = Peaks, y = delta_percent, fill = Group))+
+  geom_boxplot()+
+  stat_summary(fun.y = mean, shape = 4, size = 0.2)+
+  facet_grid(`Time (day / night)` ~ Group, scales = "free_y")+
+ # coord_cartesian(ylim = c(-100, 100))+
+ # scale_y_continuous(limits = c(-100,100))+
+  geom_hline(aes(yintercept = 0), color = "red")+
+  theme(panel.background = element_blank(),
+        axis.line = element_line(colour = "black"))
+
+
+delta_peaks %>% 
+ # filter(Peaks == "b") %>% 
+  ggplot(aes(x = In, y = delta, color = Group))+
+  geom_point()+
+  geom_smooth(aes(x = In, y = delta), method = "lm")+
+  ggpubr::stat_regline_equation(aes(label =  paste(..rr.label..)))+  
+  scale_color_manual(values = c("#D2B600", "#0B4F6C"))+
+  facet_wrap(~ Peaks, scales = "free")+
+  labs(y = "Delta intensity", x = "Ambient intensity")+
+  theme(panel.background = element_blank(),
+        axis.line = element_line(colour = "black"),
+        axis.text = element_text(size = 12, color = "black"),
+        strip.text = element_blank(),
+        axis.title = element_text(size = 14))
+```
+
+## Peaks statistics
+
+```{r}
+peak_for_stat <-  left_join(fdom_metadata, peaks_data) %>% 
+  filter(!is.na(`bix`)) %>% 
+  pivot_longer(cols = bix:hix, names_to = "Peaks", values_to = "value") %>% 
+  select(-`Vial number`) 
+
+delta_peaks
+biv_a <- peak_for_stat %>% 
+  filter(Group == "Ascidians", Peaks == "hix") %>% 
+  mutate(`Position (In / Ex)` = factor(`Position (In / Ex)`))
+
+res <- wilcox.test(formula = value ~ `Position (In / Ex)`, data = biv_a,paired = T)# %>%
+  add_significance()
+res
+
+(res <- wilcox.test(asc_a$In, asc_a$Ex, paired = T))
+```
+
+## Matrices of absolute deltas
+
+```{r}
+# Add the peaks position for the datatable of the EEM
+mean_delta_with_peaks <- mean_delta_data %>% 
+  left_join(peaks_position) #%>% 
+  filter(!Peaks %in% add_peaks_vec)
+
+# Mean
+mean_delta_with_peaks %>%
+  ggplot(aes(x = Excitation, y = Emission))+
+  geom_contour_filled(aes(z = delta_abs_mean), binwidth = 0.01)+
+  geom_text(aes(label = Peaks), colour = "white")+
+  scale_color_viridis_c()+
+  facet_wrap(~ Group)+
+  theme(panel.background = element_blank(),
+        strip.text = element_text(size = 14))
+
+# Median
+mean_delta_with_peaks %>%
+  ggplot(aes(x = Excitation, y = Emission))+
+  geom_contour_filled(aes(z = delta_abs_median), binwidth = 0.001)+
+  geom_text(aes(label = Peaks), colour = "white")+
+  scale_color_viridis_c()+
+  facet_wrap(~ Group)+
+  theme(panel.background = element_blank(),
+        strip.text = element_text(size = 14))
+
+# Sd
+mean_delta_with_peaks %>%
+  ggplot(aes(x = Excitation, y = Emission))+
+  geom_contour_filled(aes(z = delta_abs_sd), binwidth = 0.005)+
+  geom_text(aes(label = Peaks), colour = "white")+
+  scale_color_viridis_c()+
+  facet_wrap(~ Group)+
+  theme(panel.background = element_blank(),
+        strip.text = element_text(size = 14))
+
+
+# In and ex for ppt
+ind02.116 <- delta_data %>% 
+  filter(`Unique code` == "02.116") %>% 
+  select(`Unique code`, Excitation, Emission, In, Ex) %>% 
+  pivot_longer(cols = c(In, Ex), names_to = "Position", values_to = "Intensity") %>% 
+  mutate(Position = factor(Position, levels = c("In", "Ex"))) %>% 
+  left_join(peaks_position)
+
+ind02.116 %>%
+  ggplot(aes(x = Excitation, y = Emission))+
+  geom_contour_filled(aes(z = Intensity))+
+  geom_text(aes(label = Peaks), colour = "white")+
+  scale_color_viridis_c()+
+  facet_wrap(~ Position)+
+  theme(panel.background = element_blank())
+
+
+```
+
+## Matrices of Log ratio delta
+
+```{r}
+# Mean
+mean_delta_with_peaks %>%
+  ggplot(aes(x = Excitation, y = Emission))+
+  geom_contour_filled(aes(z = log_ratio_mean))+
+  geom_text(aes(label = Peaks), colour = "white")+
+  scale_color_viridis_c()+
+  facet_wrap(~ Group)+
+  theme(panel.background = element_blank())
+
+# Median
+mean_delta_with_peaks %>%
+  ggplot(aes(x = Excitation, y = Emission))+
+  geom_contour_filled(aes(z = log_ratio_median))+
+  geom_text(aes(label = Peaks), colour = "white")+
+  scale_color_viridis_c()+
+  facet_wrap(~ Group)+
+  theme(panel.background = element_blank())
+
+# Sd
+mean_delta_with_peaks %>%
+  ggplot(aes(x = Excitation, y = Emission))+
+  geom_contour_filled(aes(z = log_ratio_sd))+
+  geom_text(aes(label = Peaks), colour = "white")+
+  scale_color_viridis_c()+
+  facet_wrap(~ Group)+
+  theme(panel.background = element_blank())
+```
+
+## Analysis of day vs night ambient fdom
+
+```{r}
+# Calculate the mean matrices for day and night of the ambient (in) samples
+mean_day_night <- fdom_data %>% 
+  group_by(`Time (day / night)`, Excitation, Emission) %>% 
+  summarise_at(vars(In, Ex), funs(mean(., na.rm = T), median(., na.rm = T), sd(., na.rm = T), n())) %>% 
+  left_join(peaks_position)
+
+# plot the mean matrices
+mean_day_night %>%
+ # filter(Index == "In") %>% 
+  ggplot(aes(x = Excitation, y = Emission))+
+  geom_contour_filled(aes(z = In_mean))+
+  geom_text(aes(label = Peaks), colour = "white")+
+  scale_color_viridis_c()+
+  facet_wrap(~ `Time (day / night)`)+
+  theme(panel.background = element_blank())
+
+# Mean
+mean_day_night %>%
+ # filter(Index == "In") %>% 
+  ggplot(aes(x = Excitation, y = Emission))+
+  geom_contour_filled(aes(z = In_median))+
+  geom_text(aes(label = Peaks), colour = "white")+
+  scale_color_viridis_c()+
+  facet_wrap(~ `Time (day / night)`)+
+  theme(panel.background = element_blank())
+
+# Calculate the mean coble peaks for day and night in the ambient samples
+day_night_peaks <- peaks_data1 %>%
+  mutate(delta_amb = In - Ex, 
+         delta_per = (In - Ex) / In * 100) %>% 
+ pivot_longer(cols = 14:17, names_to = "Index", values_to = "value") %>%
+  group_by(`Time (day / night)`, Peaks, Index) %>% 
+  summarise_at(vars(value), funs(mean, median, sd, n()))%>% 
+  mutate(conf.int = sd/sqrt(n) * qt(p = 0.975, df = n-1))
+
+# Calculate delta between day and night - positive values indicate addition during night
+mean_day_night_delta <- mean_day_night %>% 
+  select(-c(5:11)) %>% 
+  pivot_wider(id_cols = c(Excitation, Emission), names_from = `Time (day / night)`, values_from = In_mean) %>% 
+  mutate(delta_abs = Night - Day, 
+         delta_per = (Night - Day) / Night *100) %>% 
+  left_join(peaks_position)
+
+# Plot the delta matrix in absolute values
+mean_day_night_delta %>%
+  ggplot(aes(x = Excitation, y = Emission))+
+  geom_contour_filled(aes(z = delta_abs))+
+  geom_text(aes(label = Peaks), colour = "white")+
+  scale_color_viridis_c()+
+  theme(panel.background = element_blank())
+
+# Plot the delta matrix in percent
+mean_day_night_delta %>%
+  ggplot(aes(x = Excitation, y = Emission))+
+  geom_contour_filled(aes(z = delta_per))+
+  geom_text(aes(label = Peaks), colour = "white")+
+  scale_color_viridis_c()+
+  theme(panel.background = element_blank())
+```
+
+# Analytical error
+
+## Subset of the duplicate samples for analytical errors
+
+```{r}
+samples_for_error
+
+eemlist_analyterror_long <- eemlist_df %>%
+  pivot_longer(cols = -c(ex, em), names_to = "Vial number", values_to = "fluor") %>% 
+  relocate(`Vial number`, .before = ex) %>% 
+  filter(`Vial number` %in% samples_for_error) 
+
+eemlist_analyterror_long %>%
+  ggplot(aes(x = ex, y = em))+
+  geom_contour_filled(aes(z = fluor))+
+  #geom_text(aes(label = Peaks), colour = "white")+
+  facet_wrap(~ `Vial number`)+
+  scale_color_viridis_c()+
+  theme(panel.background = element_blank())
+
+eemlist_df %>% 
+  ggplot()+
+  geom_point(aes(x = F378, y = F378_b))
+
+eemlist_df %>% 
+  ggplot()+
+  geom_point(aes(x = F379, y = F379_b))
+
+eemlist_df %>% 
+  ggplot()+
+  geom_point(aes(x = F352, y = F352b))
+
+eemlist_df %>% 
+  ggplot()+
+  geom_point(aes(x = F353, y = F353b))
+
+
+
+sample_error_list <- eemlist_analyterror_long %>% 
+  select(`Vial number`) %>% 
+  distinct() %>% 
+  mutate(run_num = c("R1","R1","R2","R2","R3","R3","R4","R4","R5","R5","R6","R6","R7","R7","R8","R8","R9","R9","R10","R10"))
+
+eemlist_analyterror_wide <- eemlist_analyterror_long %>%
+  left_join(sample_error_list) %>% 
+  pivot_wider(id_cols = c(ex, em), names_from = run_num, values_from = fluor)
+```
+
+#~~Do not Continue~~/~/~/~/~/~/~/~/~/~/~/~/~/~/~/~/~/~/~/~/~/~
+# Specify the folder with EEM's for converion to CSV
+
+## Run the next two chunks together
+
+```{r setup}
+knitr::opts_knit$set(root.dir = "20241029/EEM/")
+```
+
+## This chunk modify the csv files from the Jasco FP-8350 to the template that eem_read function from staRdom demand
+
+```{r}
+# Import all file names into a list - make sure the pattern is: "//.csv$"
+file_list <- list.files(path = "20241029/EEM", pattern = "//.csv$", recursive = T)
+
+# Iterate through each file, skip the instrument header information, and write back to CSV
+for (file in file_list) {
+  # Read the CSV file, skipping the first 17 rows
+  data <- read_csv(file.path(file), skip = 17, col_names = F)
+
+  # Write the modified data back to a CSV file with "_modified" appended to the name
+  write_csv(data, file.path(paste0(tools::file_path_sans_ext(file), ".csv")), col_names = F)
+}
+```
+
+
+```{r eval=FALSE, include=TRUE}
+#eem_metatemplate(eem_list, absorbance) %>%
+#  write.csv(file="metatable.csv", row.names = FALSE)
+```
+
+## Correct for dilution
+
+Data are corrected for dilution via `eem_dilution`. Each EEM is multiplied with a dilution factor (e.g. 10 if 1 part sample was diluted with 9 parts ultrapure water). Either a single numeric value for all samples or a table with a specific value for each sample is used.
+
+This step can also be done manually after calculating peaks, indices and PARAFAC components. By that, a slightly different result has to be expected if EEMs are not normalised prior to creating a PARAFAC model. In other cases there is no difference whether EEMs or results are multiplied by the dilution factor.
+
+```{r eval=TRUE, include=TRUE}
+dil_data <- meta["dilution"]
+
+eem_list <- eem_dilution(eem_list,dil_data)
+```
+
+```{r eval=FALSE, fig.width=7, message=FALSE, warning=FALSE, include=TRUE, paged.print=TRUE}
+eem_overview_plot(eem_list, spp=9) # plot spared, due to no dilution it looks like the previous plot.
+```
+
+## Smooth data
+
+Depending on your instrument, smoothing the data could be beneficial for peak picking. For PARAFAC analysis smoothing is not advised. The parameter `n` specifies the moving average window size in nm.
+
+```{r eval=TRUE, include=TRUE}
+eem4peaks <- eem_smooth(eem_list, n = 4, cores = cores)
+```
+
+```{r eval=FALSE, fig.width=7, message=FALSE, warning=FALSE, include=FALSE, paged.print=TRUE}
+eem_overview_plot(eem4peaks, spp=6)
+```
+
+## Overview of samples
+
+`summary` prints an overview of the samples containing data ranges, applied correction methods and the manufacturer of the instrument.
+
+```{r}
+summary(eem_list)
+```
+
+```{r eval=FALSE, include=FALSE}
+eem_list %>%
+  summary() %>%
+  kable(format = "latex", booktabs = T) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  #kable_styling(font_size = 5) %>%
+  row_spec(0, angle = -45) #%>%
+```
+
+```{r eval=FALSE, include=FALSE, echo=FALSE}
+kable(indices_peaks %>% mutate_if(is.numeric,prettyNum,digits = 2,format="fg"),format = "latex", booktabs = T) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  #kable_styling(font_size = 5) %>%
+  row_spec(0, angle = 45) #%>%
+```
+
+# Absorbance indices
+
+`abs_parms` can be used to calculate a254, a300, E2:E3, E4:E6, S275-295, S350-400, S300-700, SR and the wavelength distribution of absorption spectral slopes [@helms_absorption_2008; @twardowski_modeling_2004; @massicotte_cdom_2016; @loiselle_optical_2009]. Li and Hur [-@li_utilization_2017] give a broad overview of possible values and their applications used in recent literature. Missing wavelengths, needed for certain indices or ratios are interpolated automatically.
+
+```{r eval=TRUE, include=TRUE}
+slope_parms <- abs_parms(absorbance, cuvl = 1, cores = cores)
+slope_parms
+```
+
+```{r eval=FALSE, include=FALSE, echo=FALSE}
+kable(slope_parms %>% mutate_if(is.numeric,prettyNum,digits = 2,format="fg"),format = "latex", booktabs = T) %>%
+  #kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  #kable_styling(font_size = 5) %>%
+  row_spec(0, angle = 45) #%>%
+```
+
+# Creating a PARAFAC model
+
+Finding an appropriate PARAFAC model is an iterative process. For comparing different methods, we used the same dataset and analysis procedure as in the drEEM tutorial which is a supplement to Murphy et al. [-@murphy_fluorescence_2013].
+
+## Loading data
+
+### Load drEEM example dataset
+
+For this tutorial the drEEM example data is used. The complete and corrected data is downloaded from <https://gitlab.com/dreem/drEEM> and converted into an eemlist in R. The example PARAFAC models are calculated based on this complete sample set. You can also adapt that code to import any Matlab EEM data to staRdom.
+
+```{r eval=FALSE, include=TRUE}
+dreem_raw <- tempfile()
+download.file("https://gitlab.com/dreem/drEEM/-/raw/master/tutorials_demos/datasets/PortSurveyData_corrected.mat?inline=false",dreem_raw)
+dreem_data <- dreem_raw %>%
+  R.matlab::readMat()
+unlink(dreem_raw)
+
+eem_list <- lapply(dreem_data$filelist.eem, function(file){
+  #file <- dreem_data$filelist.eem[1]
+  n <- which(dreem_data$filelist.eem == file)
+  file <- file %>%
+    gsub("^//s+|//s+$", "", .) %>% # trim white spaces in filenames
+    sub(pattern = "(.*)//..*$", replacement = "//1", .) # remove file extension from sample name
+  eem <- list(file = paste0("drEEM/dataset/",file),sample = file,x = dreem_data$XcRU[n,,] %>% as.matrix(),ex = dreem_data$Ex %>% as.vector(), em = dreem_data$Em.in %>% as.vector(), location = "drEEM/dataset/")
+  class(eem) <- "eem"
+  attr(eem, "is_blank_corrected") <- TRUE
+  attr(eem, "is_scatter_corrected") <- FALSE
+  attr(eem, "is_ife_corrected") <- TRUE
+  attr(eem, "is_raman_normalized") <- TRUE
+  attr(eem, "manufacturer") <- "unknown"
+  eem
+}) %>%
+  `class<-`("eemlist")
+
+# add sample name suffix, R has sometimes troubles, when sample names start with a number.
+eem_names(eem_list) <- paste0("d",eem_names(eem_list))
+```
+
+In the drEEM tutorial, all samples containing "bl" or "0A" are removed from the set.
+
+```{r eval=FALSE, include=TRUE}
+ol <- function(x){x==("bl") | x == "0A"}
+extract <- dreem_data$sites %>% unlist() %>% ol() %>% which()
+eem_list <- eem_list %>% eem_extract(extract)
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+data(eem_list) # load example from staRdom package, this is just necessary for the actual tutorial creation. Remove this line, if you downloaded the drEEM dataset right above and want to use that.
+eem_ex <- eem_extract(eem_list,sample ="^d667sf$",keep=TRUE)
+```
+
+Scattering has still to be removed and is done as described above.
+
+```{r include = TRUE, eval = TRUE}
+eem_list <- eem_rem_scat(eem_list, remove_scatter = c(TRUE, TRUE, TRUE, TRUE), remove_scatter_width = c(15,15,18,19), interpolation = FALSE, cores = cores)
+```
+
+```{r include = FALSE, eval = TRUE}
+eem_ex <- eem_ex %>% 
+  eem_extract(sample = "^d667sf$", keep = TRUE) %>%
+  eem_rem_scat(eem_ex, remove_scatter = c(TRUE, TRUE, TRUE, TRUE), remove_scatter_width = c(15,15,18,19), interpolation = FALSE, cores = cores) %>%
+  `eem_names<-`("d667sf_2_scatter") %>%
+  eem_bind(eem_ex,.)
+```
+
+If you have worked with the [basic analysis template](Basic_analysis_of_DOM_samples.html), you can use the resulting data right away. In the case you did the corrections with different sample sets separately and want to combine them, you can use `eem_import_dir` to combine EEM samples from several RData or RDa files. Put all files in one folder and run the following:
+
+```{r include=TRUE,eval=FALSE}
+eem_list <- eem_import_dir(dir)
+```
+
+Due to package size issues, no example data is included for this function.
+
+We recommend using `eem_checkdata` again before continuing the further analysis!
+
+## Sample set wavelength ranges
+
+For a PARAFAC analysis, all samples of the set need to be similar in terms of provided wavelength pairs. In case you have deviating samples there are ways to solve this:
+
+-   `eem_extend2largest` adds NAs if values present in another sample are missing (e.g. different wavelength slits or spectra ranges were used). These values can be interpolated.
+
+-   `eem_red2smallest` removes wavelengths, that are missing in at least one sample form the whole set.
+
+## Find and remove noise in EEM data
+
+An important way of finding noise in EEM data is viewing the samples. You can use the function `eem_overview_plot` to view all your samples in a convenient way. With the following functions, data can be removed or set to NA (NAs are theoretically no problem for the PARAFAC algorithm, but the calculation process and the results are often more convient without) in different ways, or be interpolated, depending on what you would like to do:
+
+-   `eem_extract` removes whole samples either by name or by number.
+
+-   `eem_range` removes data outside the given wavelength ranges in all samples.
+
+-   `eem_exclude` removes data from the sample set, provided by a list.
+
+-   `eem_rem_scat` and `eem_remove_scattering` are used to set data in Raman and Rayleigh scattering of 1st and 2nd order to NA. While the later on removes one scattering at a time, the first one wraps it up to remove several scatterings in one step.
+
+-   `eem_setNA` replaces data by NA in rectangular shape and in specific samples.
+
+-   `eem_matmult` multiplies each EEM matrix by a certain matrix. This matrix can be used to set parts of the data to 0 or NA (e.g. the area where emission wavelength is shorter than excitation wavelength).
+
+-   `eem_interp` is used to interpolate data previously set to NA.
+
+Sample "d667sf" will be used to show this process graphically. To extract the sample the [regular expression](https://stat.ethz.ch/R-manual/R-devel/library/base/html/regex.html) "/^d667sf$" is used. ^ stands for the beginning of the string and /$ for the end and ensure an exact match. If you do not use these characters, all samples containing the string in their name are extracted.
+
+This is where we start from:
+
+```{r include=TRUE, eval = FALSE}
+eem_list %>% 
+  eem_extract(sample = "^d667sf$", keep = TRUE) %>%
+  ggeem(contour = TRUE)
+```
+
+```{r include=FALSE, eval = TRUE}
+eem_ex %>% 
+  ggeem(contour = TRUE)
+```
+
+The noisy range below 250 nm excitation and above 580 nm emission can be removed from the samples with the following command. As mentioned above, this was already removed in the example data.
+
+```{r eval=TRUE}
+eem_list <- eem_list %>% eem_range(ex = c(250,Inf), em = c(0,580))
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+eem_ex <- eem_ex %>% 
+  eem_extract(sample = "^d667sf_2_scatter$", keep = TRUE) %>%
+  eem_range(ex = c(250,Inf), em = c(0,580)) %>%
+  `eem_names<-`("d667sf_3_cut") %>%
+  eem_bind(eem_ex,.)
+```
+
+Visually found irregularities in patterns are manually replaced by NA and interpolated. From the sample "d667sf" a band covering the excitation wavelengths from 245 to 350 is removed and a rectangle covering emission wavelengths 560 to 576 and excitation wavelengths 280 to 295 is removed in all samples. For demonstration reasons, the interpolation is done in an extra step but can also be included in the removing function right away (`interpolate = TRUE`).
+
+```{r eval = TRUE, message = FALSE, warning = FALSE, include = FALSE}
+eem_ex <- eem_ex %>%
+  eem_extract(sample = "^d667sf_3_cut$", keep = TRUE) %>%
+  eem_setNA(sample = 1, ex = 345:350, interpolate = FALSE) %>% # sample 1 in staRdom data is sample 176 in drEEM data!
+  eem_setNA(em = 560:576, ex = 280:295, interpolate = FALSE) %>%
+  `eem_names<-`("d667sf_4_rem_noise") %>%
+  eem_bind(eem_ex,.) 
+```
+
+```{r include=TRUE, eval=TRUE}
+eem_list <- eem_list %>%
+  eem_setNA(sample = 176, ex = 345:350, interpolate = FALSE) %>%
+  eem_setNA(em = 560:576, ex = 280:295, interpolate = FALSE)
+```
+
+```{r eval = TRUE, include = TRUE}
+eem_list <- eem_interp(eem_list, type = 1, extend = FALSE, cores = cores)
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+eem_ex <- eem_ex %>% 
+  eem_extract(sample = "^d667sf_4_rem_noise$", keep = TRUE) %>%
+  eem_interp(type = 1, extend = FALSE, cores = cores) %>%
+  `eem_names<-`("d667sf_5_interp") %>%
+  eem_bind(eem_ex,.)
+```
+
+Here, we show the changes, made to sample d667sf by the demonstrated steps above (including the removing of the scatter):
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, fig.width=6, fig.height = 4}
+ggeem(eem_ex, contour = TRUE)
+```
+
+## Explore dataset
+
+It is crucial to find an appropriate number of components in the analysis. If the number of components is too large, it may be the case that one component was split into two; if it is too low, relevant components may get lost [@murphy_fluorescence_2013]. To help you find the appropriate number, a series of PARAFAC models can be calculated and compared. In this example 5 models with 3 to 7 components are calculated.
+
+The alternating-least-squares algorithm used to calculate the PARAFAC model optimises the components in order to minimise the residual error. The goal is to find a global minimum of the residual function. Depending on the random start values (random initialisation), different local minima can be found. To get the global minimum, a defined number `nstart` of initialisations is used for separate model calculations. The model with the smallest error is then used for further analyses, assuming it is a global minimum. 25 might by a good start for `nstart` although for a profound analysis higher values (e.g. 50) are suggested.
+
+Some of these random initialisations might not converge. If there are still enough converging models, the result is reliable and there is no problem. `eem_parafac` returns a warning in case of less than 50 % converging models. Furthermore, it is possible to calculate a specific number of converging models by setting the argument `strictly converging = TRUE`. When using this, due to the iterative restarting of not converging models, this takes more time and using more starts from the beginning is a faster way to get a reasonable number of converging models.
+
+You can speed up the calculations by using multiple `cores`. Beware, that calculating a PARAFAC model can take some time!
+
+Higher `maxit` (maximum number of iteration steps in PARAFAC) and lower `ctol` (tolerance to return result of PARAFAC, should not be larger than 10⁻⁶) increase the accuracy of the model but take more computation time. For a final model, we suggest to use a tolerance of 10⁻⁸ to 10⁻¹⁰.
+
+In this first model creation step, the constraints are tested. While `pf1` is calculated without any constraints, `pf1n` uses the assumption that modes are non-negative only. This is a very common assumption, because fluorescence cannot be negative. Common constraints are none ("uncons"), non-negative ("nonneg") and unimodal, non-negative ("uninon"). Besides these, other possible constraints can be seen using the command `CMLS::const()`.
+
+PARAFAC modes can be rescaled so that their maximum is 1 and effects are more visible in the plots. The rescaling is corrected in the A mode (sample mode). In case of uneven peak heights, `eempf_rescaleBC` can help to improve the visibility of your graphs. The parameter `newscale` specifies the root mean-squared error of each column in matrices B and C. This is compensated in the A mode (sample mode). Alternatively `newscale` can be set `"Fmax"`; each peak has a height of 1 then.
+
+The PARAFAC models created below can be loaded from the staRdom package's example data instead of calculating it:
+
+```{r include=TRUE, eval = TRUE}
+data(pf_models)
+```
+
+```{r include=TRUE}
+# minimum and maximum of numbers of components
+dim_min <- 3
+dim_max <- 7
+```
+
+```{r eval=FALSE,include=TRUE}
+nstart <- 25 # number of similar models from which best is chosen
+maxit = 5000 # maximum number of iterations in PARAFAC analysis
+ctol <- 10^-6 # tolerance in PARAFAC analysis
+
+# calculating PARAFAC models, one for each number of components
+pf1 <- eem_parafac(eem_list, comps = seq(dim_min,dim_max), normalise = FALSE, const = c("uncons", "uncons", "uncons"), maxit = maxit, nstart = nstart, ctol = ctol, cores = cores)
+
+# same model but using non-negative constraints
+pf1n <- eem_parafac(eem_list, comps = seq(dim_min,dim_max), normalise = FALSE, const = c("nonneg", "nonneg", "nonneg"), maxit = maxit, nstart = nstart, ctol = ctol, cores = cores)
+
+# rescale B and C modes to a maximum fluorescence of 1 for each component
+pf1 <- lapply(pf1, eempf_rescaleBC, newscale = "Fmax")
+pf1n <- lapply(pf1n, eempf_rescaleBC, newscale = "Fmax")
+```
+
+Use `eempf_compare` to plot the created models' components. You can see the models fits and components (rows) for models with different numbers of components (columns) in 2 different views. The single plots can be created using `eempf_fits` and `eempf_plot_comps`.
+
+```{r eval=FALSE, include=TRUE, fig.width=6, fig.height=5}
+# This plot is not shown, because the components violate the assumptions for fluorescence peaks (negative fluorescence). Please try, if you are interested.
+eempf_compare(pf1, contour = TRUE)
+```
+
+```{r eval=TRUE, include=TRUE, fig.width=6, fig.height=5}
+eempf_compare(pf1n, contour = TRUE)
+```
+
+## Check the correlation between different components
+
+The PARAFAC algorithm assumes no correlation between the components. If samples are in a wide range of DOC concentrations, a correlation of the components is likely. To avoid that, the samples can be normalised. The model with 6 components (4th model in the list, therefore `[[4]]`) is used for now.
+
+```{r eval=TRUE, include=TRUE, fig.width=7}
+# check for correlation between components table
+eempf_cortable(pf1n[[4]], normalisation = FALSE)
+```
+
+```{r eval=TRUE, include=TRUE, fig.width=6, fig.height=5}
+eempf_corplot(pf1n[[4]], progress = FALSE, normalisation = FALSE)
+```
+
+As some of the components are highly correlated, the model is calculated again with normalised sample data. Later normalisation is reversed automatically by multiplying the A modes (samples loadings) with the normalisation factors for exports and plots. Reversing normalisation can be done manually applying `norm2A`. The parameter `normalisation` in `eempf_cortable` and `eempf_corplot` is set `FALSE` (default) if the model quality is to be assessed. For interpretations and patterns in the actual fluorescence in your samples `normalisation` has to be set `TRUE` to see the actual values.
+
+```{r eval=FALSE,include=TRUE}
+pf2 <- eem_parafac(eem_list, comps = seq(dim_min,dim_max), normalise = TRUE, const = c("nonneg", "nonneg", "nonneg"), maxit = maxit, nstart = nstart, ctol = ctol, cores = cores)
+
+# rescale B and C modes
+pf2 <- lapply(pf2, eempf_rescaleBC, newscale = "Fmax")
+```
+
+```{r eval=TRUE, include=TRUE, fig.width=6, fig.height=5}
+# eempf_compare(pf2, contour = TRUE) # use this to show the same plot as above
+# for now, we are happy with just the components
+eempf_plot_comps(pf2, contour = TRUE, type = 1)
+```
+
+## Find and exclude outliers leverage
+
+The leverage is calculated by `eempf_leverage` and can be plotted with `eempf_leverage_plot`. Using `eempf_leverage_ident` to plot the leverage shows an interactive plot where you can click on certain values to save them in a variable. Three plots (samples, excitation, emission) show up one after the other. You can select wavelengths or samples by clicking on the certain point in the plot and click 'Finish' when you are done. The variable `exclude` in the example contains all selected values. The returned list can directly be used to exclude the outliers using `eem_exclude` (see above). `qlabel` defines the size of the upper quantile that is labelled in the plots. `eempf_mleverage` can be used to compare the leverages of samples in different models.
+
+```{r fig.width=6}
+# calculate leverage
+cpl <- eempf_leverage(pf2[[4]])
+
+# plot leverage (nice plot)
+eempf_leverage_plot(cpl,qlabel=0.1)
+```
+
+```{r eval=FALSE, include=TRUE, fig.width=7}
+# plot leverage, not so nice plot but interactive to select what to exclude
+# saved in exclude, can be used to start over again with eem_list_ex <- eem_list %>% eem_exclude(exclude) above
+exclude <- eempf_leverage_ident(cpl,qlabel=0.1)
+```
+
+In order to save the decisions of the graphical outlier determination not only as a variable but also in a script, we advise to generate the exclude list manually. This can help you following your way later. See example below.
+
+```{r eval=FALSE, include=TRUE}
+# samples, excitation and emission wavelengths to exclude, makes sense after calculation of leverage
+exclude <- list("ex" = c(),
+                "em" = c(),
+                "sample" = c("dsfb676psp","dsgb447wt")
+)
+
+# exclude outliers if neccessary. if so, restart analysis
+eem_list_ex <- eem_exclude(eem_list, exclude)
+```
+
+A new PARAFAC model is then generated without outliers:
+
+```{r eval=FALSE, include=TRUE}
+pf3 <- eem_parafac(eem_list_ex, comps = seq(dim_min,dim_max), normalise = TRUE, maxit = maxit, nstart = nstart, ctol = ctol, cores = cores)
+pf3 <- lapply(pf3, eempf_rescaleBC, newscale = "Fmax")
+```
+
+```{r eval=TRUE, include=TRUE, fig.width=6, fig.height=5}
+eempf_plot_comps(pf3, contour = TRUE, type = 1)
+```
+
+```{r eval=TRUE, include=TRUE, fig.width=7}
+eempf_leverage_plot(eempf_leverage(pf3[[4]]),qlabel=0.1)
+```
+
+## Examine residuals
+
+The outliers determined above are included to show the difference in residuals. Analysing these residuals can show deficits in model creation, problems with sample handling and lab equipment or it can already be helpful in answering scientific questions.
+
+```{r eval=FALSE, include=TRUE, fig.width=6, fig.height=5}
+eempf_residuals_plot(pf3[[4]], eem_list, residuals_only = TRUE, select = c("d0680sfK", "d1266sf", "d1268sfK", "d1543sfK", "dsfb676psp", "dsgb447wt"), spp = 6, cores = cores, contour = TRUE)
+```
+
+```{r eval=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=6, fig.height=5}
+data("eem_list_outliers")
+eem_list %>%
+  eem_extract(5:15) %>%
+  eem_bind(eem_list_outliers) %>%
+  eem_red2smallest() %>%
+  eempf_residuals_plot(pf3[[4]], ., residuals_only = TRUE, spp = 6, cores = cores, contour = TRUE) %>%
+  invisible()
+```
+
+## Recalculating the model with increased accuracy
+
+Due to long calculation times with higher accuracy in the model calculation, the tolerance is only increased in the last step. Just the model with 6 components is recalculated. We use `strictly_converging = TRUE` here to derive a meaningful number of truly converging models. If you set this argument to `FALSE`, please check the ratio of converging models to be sure, the best is chosen from a reasonably high number.
+
+```{r eval=FALSE, include=TRUE}
+ctol <- 10^-8 # decrease tolerance in PARAFAC analysis
+nstart = 20 # number of random starts
+maxit = 10000 # increase number of maximum interations
+
+pf4 <- eem_parafac(eem_list_ex, comps = 6, normalise = TRUE, const = c("nonneg", "nonneg", "nonneg"), maxit = maxit, nstart = nstart, ctol = ctol, output = "all", cores = cores, strictly_converging = TRUE)
+
+pf4 <- lapply(pf4, eempf_rescaleBC, newscale = "Fmax")
+```
+
+Check the convergence behaviour of the created models:
+
+```{r eval=TRUE, include=TRUE, fig.width=4, fig.height=6}
+eempf_convergence(pf4[[1]])
+```
+
+```{r eval=FALSE, include=TRUE, fig.width=4, fig.height=6}
+# just one model, not really a need to compare
+eempf_compare(pf4, contour = TRUE)
+```
+
+```{r eval=TRUE, include=TRUE, fig.width=6}
+eempf_leverage_plot(eempf_leverage(pf4[[1]])) # [[1]] means the 4th model in the list, 6 component model in that case
+```
+
+```{r eval=TRUE, include=TRUE, fig.width=6, fig.height=5}
+eempf_corplot(pf4[[1]], progress = FALSE)
+```
+
+It is possible to use the results from a previous model as starting conditions (`Astart`, `Bstart` and `Cstart`). Supplying start matrices is only possible if a model with the same number of components, excitation and emission wavelengths is calculated. If samples differ (e.g. outlier removal or inclusion) simply remove the `Astart`. In the example, we set up a very rough model using a reduced tolerance but a lot of random starts. In case of doubts, do not use start matrices!
+
+```{r eval=FALSE, include=TRUE}
+# calculating a rough model, nstart is high (100) but ctol is 2 magnitudes larger or at least 0.01
+pf5 <- eem_parafac(eem_list, comps = 6, normalise = TRUE, const = c("nonneg", "nonneg", "nonneg"), maxit = maxit, nstart = 100, ctol = min(ctol*100,0.01), cores = cores)
+
+# plot is not shown
+ggeem(pf5[[1]], contour = TRUE)
+
+nstart <- 5
+pf4 <- eem_parafac(eem_list_ex, comps = 6, normalise = TRUE, const = c("nonneg", "nonneg", "nonneg"), maxit = maxit, nstart = nstart, ctol = ctol, cores = cores, Bstart = pf5[[1]]$B, Cstart = pf5[[1]]$C)
+
+pf4 <- lapply(pf4, eempf_rescaleBC, newscale = "Fmax")
+
+# plot is not shown
+ggeem(pf4[[1]], contour = TRUE)
+```
+
+Please redo the steps dscribed in the section "Creating a PARAFAC model" until you are satisfied with the results.
+
+## Plot the resulting components and loadings
+
+The following plot shows the shape of the determined components and the loadings in the different samples. The components' shapes are important for an interpretation from a chemical point of view. The loadings show the fluorescence differences of different components in different samples.
+
+```{r eval=TRUE, include=TRUE, fig.width=6, fig.height=5}
+eempf_comp_load_plot(pf4[[1]], contour = TRUE)
+
+# eempf_plot_comps(pf4[1], type = 2) # this function can be used to view the B- and C-modes
+```
+
+Separate plots can be generated by using `ggeem` for components and `eempf_load_plot` for the loadings.
+
+It is possible to view the components in 3D using `eempf_comps3D`.
+
+## Plotting samples and residuals
+
+The plots show samples in columns and the rows show the components (6 in that case), the residuals and the whole sample.
+
+```{r eval=TRUE, fig.height=7, fig.width=6, warning=FALSE, include=TRUE}
+# plot components in each sample, residual and whole sample
+eempf_residuals_plot(pf4[[1]], eem_list, select = eem_names(eem_list)[10:14], cores = cores, contour = TRUE)
+```
+
+## Split-half analysis
+
+The split-half analysis is intended to show the stability of your model. The data is recombined in 6 different ways and results from each sub-sample should be similar [@murphy_fluorescence_2013].
+
+```{r eval=FALSE, include=TRUE}
+#calculate split_half analysis
+sh <- splithalf(eem_list_ex, 6, normalise = TRUE, rand = FALSE, cores = cores, nstart = nstart, strictly_converging = TRUE, maxit = maxit, ctol = ctol)
+```
+
+Split-half analysis takes some time, so the results are included in the package.
+
+```{r eval=TRUE, include=TRUE, fig.width=7}
+data(sh)
+```
+
+Plot the results from the split-half analysis. Your model is stable, if the graphs of all components look similar.
+
+```{r eval=TRUE, include=TRUE, fig.width=6}
+splithalf_plot(sh)
+
+# you can also use the already known plots from eempf_compare
+# sh %>% unlist(recursive = FALSE) %>% eempf_compare()
+```
+
+If some splits look similar (or see below, have a Tucker's congruency coefficient close to 1) and others do not, this is a strong hint that the particular splits or the values for `maxit` and `nstart` might be responsible for unstable conditions. Problems can be caused by splitting the data according to natural differences (e.g. sampling date A and sampling date B) which will then lead to different PARAFAC models. Changing these manually (using the parameter `splits = ...`) or randomly (`rand = TRUE`, used in the example below) can help in that case.
+
+```{r eval=FALSE, include=TRUE}
+sh_r <- splithalf(eem_list_ex, 6, normalise = TRUE, rand = TRUE, cores = cores, nstart = nstart, maxit = maxit, ctol = ctol)
+```
+
+Tucker's Congruency Coefficients is a value for the similarity of the splits (and different loadings in general) and `splithalf_tcc` returns a table showing the values. 1 would be perfect similarity.
+
+```{r eval=TRUE, include=TRUE, fig.width=7}
+tcc_sh_table <- splithalf_tcc(sh)
+
+tcc_sh_table
+```
+
+The function `eempf_ssc` can be used to compare models, not only from a split-half analysis. It returns the shift- and shape-sensitive congruence [SSC, @wunsch_emerging_2019]. Alternatively, the TCC can be calculated using the attribute `tcc = TRUE`. TCCs and SSCs can be combined over excitation and emission spectra using `m = TRUE` to calculate the modified TCC [@parr_comparafac_2014] or modified SSC respectively.
+
+## Loadings of outliers
+
+A modes (loadings) of previously excluded outliers can be calculated using `A_missing`. This should be used carefully, but enables you to get loadings, that can be further investigated. Please supply an eemlist containing all samples you are interested in. B- and C-modes of the original model are kept and A-modes are calculated.
+
+```{r include = TRUE, eval = TRUE}
+pf4_wOutliers <- A_missing(eem_list, pfmodel = pf4[[1]], cores = cores)
+```
+
+## Further model validation
+
+### Core consistency
+
+As a way of model validation, the core consistency can be calculated. Please see Murphy et al. [-@murphy_fluorescence_2013] for the limited usability of core consistency for model validation from natural EEMs.
+
+```{r eval=FALSE, include=TRUE, fig.width=7}
+corcondia <- eempf_corcondia(pf4[[1]], eem_list_ex)
+```
+
+### EEMqual
+
+EEMqual is a quality parameter integrating the model fit, the core consistency and the split-half analysis according to Bro and Vidal [-@bro_eemizer:_2011]. Due to the fact that the core consistency is included, the limitations are similar (see above).
+
+```{r eval=FALSE, include=TRUE, fig.width=7}
+eemqual <- eempf_eemqual(pf4[[1]], eem_list_ex, sh, cores = cores)
+```
+
+### Importance of components
+
+Currently, there is not one particular way to determine the importance of each component in a model. Still, answering this question is interesting from an ecological point of view. Here, we propose one way, that is commonly used in different modelling processes. You can calculate the component importance using `eempf_varimp`. Starting from the model you created, each component is removed at a time and a new model is created using the exact previous components. The difference between the original R-squared and the one from the new model with one component reduced.
+
+```{r eval=FALSE, include=TRUE, fig.width=7}
+varimp <- eempf_varimp(pf4[[1]], eem_list_ex, cores = cores)
+```
+
+# Formatting a model
+
+## Naming models and components
+
+Models and components can be named. These names can be important for you to organise your models and interpretations of the components. They are also shown in the plots. Here are some examples:
+
+```{r fig.width=6}
+# get current model names (none set so far!)
+names(pf3)
+# set new model names, number of models must be equal to number of names
+names(pf3) <- c("3 components", "4 components xy","5 components no outliers","6 components","7 components")
+names(pf3)
+
+# get current component names
+eempf_comp_names(pf4)
+# set new model names, number of models must be equal to number of names
+eempf_comp_names(pf4) <- c("A4","B4","C4","D4","E4","F4")
+
+# in case of more than one model(e.g. pf3):
+eempf_comp_names(pf3) <- list(c("A1","B1","C1"), # names for 1st model
+                                       c("humic","T2","whatever","peak"),
+                                       c("rose","peter","frank","dwight","susan"),
+                                       c("A4","B4","C4","D4","E4","F4"),
+                                       c("A5","B5","C5","D5","E5","F5","G5") # names for 5th model
+)
+
+pf4[[1]] %>%
+  ggeem(contour = TRUE)
+```
+
+## Sorting components
+
+Components within a PARAFAC model can be reordered using `eempf_reorder`.
+
+# Model export and interpretation
+
+## Comparing your data using openfluor.org
+
+You can use `eempf_openfluor` to export a file that can be uploaded to openfluor.org [@murphy_openfluor_2014]. Please check the file header manually after export as some values are not set automatically. Openfluor offers ways to compare your components with those found in other publications. This is a very important step in interpreting the results and coming to ecological sound conclusions. Models can be directly uploaded to openfluor.org. Please see the help of `eempf_openfluor` for details.
+
+```{r eval=FALSE, include = TRUE}
+eempf_openfluor(pf4[[1]], file = "my_model_openfluor.txt")
+```
+
+## Comparing data using SSC
+
+[@wunsch_emerging_2019] showed, that the TCC is sometimes not sensitive enough to separate different components. Therefore, they developed the shift- and shape sensitive congruence coefficient (SSC). It can be calculated using the function `eempf_ssc`.
+
+## Creating a report on your analysis
+
+The report created by `eempf_report` contains important settings and results of your analysis and is exported as an html file. You can specify the information you want to include.
+
+```{r eval=FALSE, include = TRUE}
+eempf_report(pf4[[1]], export = "parafac_report.html", eem_list = eem_list, shmodel = sh, performance = TRUE)
+```
+
+## Exporting the model
+
+Using `eempf_export` you can export your model matrices to a csv file.
+
+`eem_metatemplate` is intended as a list of samples and a template for a table containing metadata. Writing this table to a file eases the step of gathering needed values for all samples.
+
+## Combine results and handle dilution issues
+
+`eem_dilcorr` creates a table containing information on how to handle diluted samples. Absorbance spectra need to be replaced by undiluted measurements preferably or multiplied by the dilution factor. Names of EEM samples can be adjusted to be similar to their undiluted absorbance sample. You can choose for each sample how you want to proceed on the command line. The table contains information about these two steps.
+
+`eem_absdil` takes information from the table generated by `eem_dilcorr` and multiplies or deletes undiluted absorbance sample data.
+
+`eem_eemdil` takes information from the table generated by `eem_dilcorr` and renames EEM samples to match undiluted absorbance samples.
+
+# Experimental(!) functions
+
+## SSCs between initialisations
+
+The shift- and shape sensitive congruence coefficient [SSC, @wunsch_emerging_2019] (or TCC) between the e.g. 3 to 6 best initialisations of the model could be an indicator to evaluate the stability of the model creation process. If one of the components is much different from the others, the best model is a lucky guess. Models with several initialisations giving very similar results are more trustworthy. You might overthink the modelling parameters and the preprocessing. To do this test, you need to keep all created models by adding the argument `output = "all"` to the `eem_parafac` function.
+
+```{r eval=FALSE, include=TRUE, fig.width=7}
+pf4 <- eem_parafac(eem_list_ex, comps = 6, normalise = TRUE, const = c("nonneg", "nonneg", "nonneg"), maxit = maxit, nstart = nstart, ctol = ctol, output = "all", cores = cores)
+
+ssccheck <- eempf_ssccheck(pf4[[1]]$models, best = 3, cores = cores) # best 3 models are shown
+
+eempf_plot_ssccheck(ssccheck)
+```
+
+## Recombining components
+
+Recombining the components of a PARAFAC model is generally not advised. It should be an opportunity for advanced users to work through their data, test hypothesis and find new approaches. The results from such a model have to be investigated in detail and differ significantly from models created in the traditional way. Please beware of using these functions!
+
+Components can be extracted from models using `eempf_excomp`. The extracted components can then be used to create new models using `A_missing` and the `components` argument.
+
+# References
